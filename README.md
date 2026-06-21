@@ -43,6 +43,7 @@ persists and you never log in again.
 | sequential-thinking | @modelcontextprotocol/server-sequential-thinking | Structured reasoning |
 | fetch | mcp-server-fetch | Web fetch |
 | apple-music | local (`mcp-servers/apple-music`) | Control Music.app by voice: play/pause/next, search & play library tracks, playlists, volume, shuffle |
+| spotify | local (`mcp-servers/spotify`) | Play any song via the Spotify app — NO credentials. AppleScript playback; song names resolved to track ids with the Playwright browser tools (Spotify's public search). Just needs the Spotify app logged in |
 
 ## Action-approval policy
 

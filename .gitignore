@@ -10,3 +10,4 @@ secrets.sh
 
 # Local overrides with real values
 settings.local.json
+.spotify-creds.sh
