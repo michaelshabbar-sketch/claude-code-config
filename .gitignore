@@ -1,0 +1,12 @@
+# Never commit actual secrets
+.env
+.env.local
+secrets.sh
+*credentials*
+
+# Gmail OAuth tokens (contain the never-expiring refresh token)
+*token.json*
+.gmail-mcp/
+
+# Local overrides with real values
+settings.local.json

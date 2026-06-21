@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""usage — your AI spend & limits at a glance (Claude Code + OpenAI Codex). Local, read-only.
+
+Honest accounting:
+  - Claude Code is metered (pay per token) -> real $ (live in the status bar 💲).
+  - Codex runs on your ChatGPT plan; on the FREE plan that's $0 out of pocket — the
+    constraint is rate limits, not dollars.
+"""
+import os, json, glob, datetime
+
+HOME = os.path.expanduser("~")
+today = datetime.date.today()
+
+def codex_today_tokens():
+    total = 0
+    base = f"{HOME}/.codex/sessions/{today:%Y/%m/%d}"
+    for f in glob.glob(f"{base}/*.jsonl"):
+        best = 0
+        try:
+            for line in open(f, encoding="utf-8", errors="replace"):
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    info = (json.loads(line).get("payload") or {}).get("info")
+                except Exception:
+                    info = None
+                if isinstance(info, dict):
+                    for k in ("total_tokens", "total_token_usage", "total"):
+                        v = info.get(k)
+                        if isinstance(v, dict):
+                            v = v.get("total_tokens") or v.get("total")
+                        if isinstance(v, (int, float)):
+                            best = max(best, int(v))
+        except Exception:
+            pass
+        total += best
+    return total
+
+def codex_plan():
+    try:
+        a = json.load(open(f"{HOME}/.codex/auth.json"))
+        import base64
+        for v in a.values():
+            if isinstance(v, str) and v.count(".") == 2:
+                p = v.split(".")[1]; p += "=" * (-len(p) % 4)
+                d = json.loads(base64.urlsafe_b64decode(p))
+                pt = (d.get("https://api.openai.com/auth", {}) or {}).get("chatgpt_plan_type") or d.get("chatgpt_plan_type")
+                if pt: return pt
+    except Exception:
+        pass
+    return "free"
+
+plan = codex_plan()
+tok = codex_today_tokens()
+paid = plan not in ("free", None, "")
+
+print("\n  💸  YOUR AI USAGE & MONEY\n")
+print("  ── Claude Code ──")
+print("     Money:  METERED (pay per token) — real $.")
+print("     See:    live session cost shows as 💲 in your status bar.")
+print("     Limits: 5-hour + weekly caps on your plan (Claude shows a warning near them).")
+print()
+print("  ── Codex (OpenAI) ──")
+print(f"     Plan:   {plan}" + ("" if paid else "  → $0 out of pocket (free plan)"))
+print(f"     Money:  {'metered/credits' if paid else '$0 — nothing to pay'}")
+print(f"     Usage:  ~{tok:,} tokens today" + ("" if tok else " (no token totals logged yet today)"))
+print("     Limits: rate-limited; if you hit it, it resets on a timer (was ~Jul 20).")
+print()
+print("  Bottom line: the only thing that costs real money is Claude — watch the 💲.\n")

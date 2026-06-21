@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""imsg-send — send an iMessage by NAME, with built-in two-step (2x) confirmation.
+
+Usage:
+  imsg-send "<name>" "<message>"      step 1: stage + show a preview (sends NOTHING)
+  imsg-send --confirm <token>         step 2: actually send (the one outbound action)
+  imsg-send --to <handle> "<message>" stage to an explicit phone/email (skip name lookup)
+
+How the 2x gate works (enforced by the local engine, not just this script):
+  Step 1 -> POST /send/prepare: stages the text, returns a PREVIEW + a one-time token
+            (valid ~120s). Nothing leaves the Mac.
+  Step 2 -> POST /send/confirm: consumes that token and performs the irreversible send.
+The engine audit-logs every action (hash of the text, not the text). 100% local socket.
+"""
+import sys, os, json, socket, http.client, subprocess
+
+SOCK = os.path.expanduser("~/.imessage-engine/imsg.sock")
+
+def engine(method, path, body=None):
+    """One request to the engine over its Unix socket -> (status, json|text)."""
+    conn = http.client.HTTPConnection("localhost", timeout=10)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(10); s.connect(SOCK)
+    except OSError as e:
+        sys.exit(f"✗ iMessage engine not reachable ({SOCK}): {e}\n  (it auto-starts on read; try `imsg <name>` once, then retry.)")
+    conn.sock = s
+    data = json.dumps(body).encode() if body is not None else None
+    conn.request(method, path, body=data,
+                 headers={"Content-Type": "application/json"} if data else {})
+    r = conn.getresponse(); raw = r.read().decode("utf-8", "replace"); conn.close()
+    try: return r.status, json.loads(raw)
+    except Exception: return r.status, raw
+
+def resolve(name):
+    """Name -> (label, single handle). Refuses to guess when ambiguous (wrong recipient = bad)."""
+    n = name.strip()
+    if "@" in n and " " not in n:                         # raw email
+        return n, n
+    if "@" not in n and " " not in n and sum(c.isdigit() for c in n) >= 7:  # raw phone
+        return n, n
+    try:
+        out = subprocess.run(["imsg", "--json", name], capture_output=True, text=True, timeout=15).stdout
+        info = json.loads(out)
+    except Exception:
+        sys.exit(f"✗ couldn't resolve '{name}' (is `imsg` on PATH?)")
+    phones, emails, label = info.get("phones", []), info.get("emails", []), info.get("label", name)
+    if len(phones) == 1:                 return label, phones[0]
+    if not phones and len(emails) == 1:  return label, emails[0]
+    cands = phones + emails
+    if not cands:
+        sys.exit(f"✗ no contact found for '{name}'. Add an alias to ~/.imsg-aliases.json, or use --to <handle>.")
+    sys.exit(f"✗ '{label}' is ambiguous: {', '.join(cands)}\n  pick one: imsg-send --to <handle> \"<message>\"")
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__); return
+
+    if a[0] == "--confirm":                              # step 2: send
+        if len(a) < 2: sys.exit("usage: imsg-send --confirm <token>")
+        st, res = engine("POST", "/send/confirm", {"token": a[1]})
+        if st == 200 and not (isinstance(res, dict) and res.get("error")):
+            detail = res.get("result") or res.get("status") or "ok" if isinstance(res, dict) else res
+            print(f"✅ sent — {detail}")
+        else:
+            sys.exit(f"✗ send failed ({st}): {res}")
+        return
+
+    if a[0] == "--to":
+        if len(a) < 3: sys.exit('usage: imsg-send --to <handle> "<message>"')
+        label, handle, text = a[1], a[1], a[2]
+    else:
+        if len(a) < 2: sys.exit('usage: imsg-send "<name>" "<message>"')
+        label, handle = resolve(a[0]); text = a[1]
+
+    st, res = engine("POST", "/send/prepare", {"handle": handle, "text": text})   # step 1: stage
+    if st != 200 or (isinstance(res, dict) and res.get("error")):
+        sys.exit(f"✗ prepare failed ({st}): {res}")
+    token   = res.get("token")   if isinstance(res, dict) else None
+    preview = res.get("preview") if isinstance(res, dict) else res
+    print("📤 STAGED — nothing has been sent yet:")
+    print(f"   to:   {label}  <{handle}>")
+    print(f"   text: {text}")
+    if preview and preview not in (text, None):
+        print(f"   engine preview: {preview}")
+    if token:
+        print(f"\n   ▶ to actually SEND (within ~120s):  imsg-send --confirm {token}")
+    else:
+        print("   ⚠ no token returned — check the engine; nothing staged.")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""imsg — read recent iMessages with someone by NAME (fast).
+
+Usage:
+  imsg <name> [count]      e.g.  imsg alex      imsg "sam" 15
+  imsg --who <name>        just resolve the contact (no messages)
+
+Resolves the name via macOS Contacts (handles nicknames/aliases), then prints the
+last N messages from chat.db — decoding text, and labeling photos, Apple Cash
+payments, attachments, and reactions. 100% local; reads only.
+"""
+import sqlite3, os, sys, re, datetime, glob, json
+
+HOME = os.path.expanduser("~")
+CHATDB = f"{HOME}/Library/Messages/chat.db"
+ALIAS_FILE = f"{HOME}/.imsg-aliases.json"
+
+# Personal aliases (name -> phone/email) live ONLY in ~/.imsg-aliases.json (gitignored,
+# never published) so this tool stays free of personal data.
+ALIASES = {}
+if os.path.exists(ALIAS_FILE):
+    try: ALIASES.update({k.lower(): v for k, v in json.load(open(ALIAS_FILE)).items()})
+    except Exception: pass
+
+def norm(p):  # last 10 digits of a phone
+    d = re.sub(r"\D", "", p or "")
+    return d[-10:] if len(d) >= 10 else d
+
+def find_contact(q):
+    """Return (label, set(phone10), set(email)) best-matching the query."""
+    ql = q.lower().strip()
+    if ql in ALIASES:
+        v = ALIASES[ql]
+        return (q, {norm(v)} if any(c.isdigit() for c in v) else set(),
+                {v.lower()} if "@" in v else set())
+    parts = ql.split()
+    phones, emails, names = set(), set(), []
+    for db in glob.glob(f"{HOME}/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"):
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            rows = c.execute("""
+              SELECT COALESCE(r.ZFIRSTNAME,''),COALESCE(r.ZLASTNAME,''),COALESCE(r.ZNICKNAME,''),
+                     COALESCE(r.ZORGANIZATION,''), p.ZFULLNUMBER, e.ZADDRESS
+              FROM ZABCDRECORD r
+              LEFT JOIN ZABCDPHONENUMBER p ON p.ZOWNER=r.Z_PK
+              LEFT JOIN ZABCDEMAILADDRESS e ON e.ZOWNER=r.Z_PK""").fetchall()
+            c.close()
+        except Exception:
+            continue
+        for fn, ln, nick, org, ph, em in rows:
+            hay = " ".join([fn, ln, nick, org]).lower()
+            ok = (ql in hay) or all(part in hay for part in parts)
+            if ok and (fn or ln or nick or org):
+                names.append(f"{fn} {ln}".strip() or nick or org)
+                if ph: phones.add(norm(ph))
+                if em: emails.add(em.lower())
+    label = names[0] if names else q
+    return (label, {p for p in phones if p}, emails)
+
+def decode_ab(ab):
+    if not ab: return None
+    try:
+        seg = ab[ab.find(b"NSString"):]
+        p = seg.find(b"+")
+        if p < 0: return None
+        j = p + 1; first = seg[j]
+        if first == 0x81: length = int.from_bytes(seg[j+1:j+3], "little"); k = j+3
+        elif first == 0x82: length = int.from_bytes(seg[j+1:j+5], "little"); k = j+5
+        else: length = first; k = j+1
+        t = seg[k:k+length].decode("utf-8", "replace").replace("￼", "").replace("�", "").strip()
+        return t or None
+    except Exception:
+        return None
+
+REACT = {2000:"❤️ loved",2001:"👍 liked",2002:"👎 disliked",2003:"😂 laughed",
+         2004:"‼️ emphasized",2005:"❓ questioned",
+         3000:"removed ❤️",3001:"removed 👍",3002:"removed 👎",3003:"removed 😂",
+         3004:"removed ‼️",3005:"removed ❓"}
+
+def classify(text, ab, hasatt, amt, balloon, mime):
+    if amt in REACT: return f"[reaction: {REACT[amt]}]"
+    t = (text or "") or (decode_ab(ab) or "")
+    t = t.strip() if t else ""
+    if balloon:
+        bb = balloon.decode("utf-8", "replace") if isinstance(balloon, bytes) else (balloon or "")
+        if "PeerPayment" in bb: return "💵 [Apple Cash payment]"
+        mu = re.search(rb'https?://[^\s\x00-\x1f"\\<>]+', ab or b"")
+        url = mu.group(0).decode("utf-8", "replace") if mu else (t if t.startswith("http") else None)
+        if url:
+            url = re.split(r'[￼�]', url)[0].strip()  # drop trailing object/replacement chars
+            return "🔗 " + url
+        low = bb.lower()
+        if "pigeon" in low: return "[GamePigeon]"
+        if "music" in low: return "[Apple Music]"
+        return t if t else "[app message]"
+    if t: return t
+    if mime:
+        m = mime.decode() if isinstance(mime, bytes) else mime
+        kind = "Photo" if "image" in m else "Video" if "video" in m else "Audio" if "audio" in m else "File"
+        return f"[{kind}]"
+    if hasatt: return "[attachment]"
+    return "[no text]"
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    who_only = "--who" in args
+    json_out = "--json" in args
+    args = [a for a in args if a not in ("--who", "--json")]
+    if not args:
+        print(__doc__); return
+    count = 12
+    if len(args) >= 2 and args[-1].isdigit():
+        count = int(args[-1]); name = " ".join(args[:-1])
+    else:
+        name = " ".join(args)
+
+    label, phones, emails = find_contact(name)
+    if json_out:  # stable machine contract (used by imsg-send to pick the recipient)
+        print(json.dumps({"label": label, "phones": sorted(phones),
+                          "emails": sorted(emails),
+                          "handles": sorted(phones) + sorted(emails)}))
+        return
+    if not phones and not emails:
+        print(f"No contact found for '{name}'. Try a different spelling, or add an alias to {ALIAS_FILE}")
+        return
+    handles = sorted(phones) + sorted(emails)
+    print(f"📇 {label}  ({', '.join(handles)})")
+    if who_only: return
+
+    con = sqlite3.connect(f"file:{CHATDB}?mode=ro", uri=True); con.text_factory = bytes
+    likes, params = [], []
+    for p in phones: likes.append("h.id LIKE ?"); params.append(f"%{p}%")
+    for e in emails: likes.append("LOWER(h.id)=?"); params.append(e)
+    q = f"""SELECT m.date,m.is_from_me,m.text,m.attributedBody,m.cache_has_attachments,
+                   m.associated_message_type,m.balloon_bundle_id,
+                   (SELECT a.mime_type FROM message_attachment_join maj
+                      JOIN attachment a ON a.ROWID=maj.attachment_id
+                      WHERE maj.message_id=m.ROWID LIMIT 1) AS mime
+            FROM message m JOIN handle h ON m.handle_id=h.ROWID
+            WHERE ({' OR '.join(likes)})
+            ORDER BY m.date DESC LIMIT ?"""
+    rows = con.execute(q, params + [count]).fetchall()
+    if not rows:
+        print("  (no messages found)"); return
+    print(f"  last {len(rows)} messages (oldest first):\n")
+    for date, fromme, text, ab, hasatt, amt, balloon, mime in reversed(rows):
+        when = datetime.datetime.fromtimestamp(date/1e9 + 978307200).strftime("%b %d %I:%M%p")
+        txt = (text.decode("utf-8","replace") if text else None)
+        body = classify(txt, ab, hasatt, amt, balloon, mime)
+        speaker = "You" if fromme else label.split()[0]
+        print(f"  [{when}] {speaker}: {body}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(brew search *)",
+      "Bash(brew --version)",
+      "Bash(brew list *)",
+      "Bash(npm --version)",
+      "Bash(npx --version)",
+      "Bash(pip3 --version)",
+      "Bash(npm install *)"
+    ]
+  }
+}
