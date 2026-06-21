@@ -105,6 +105,15 @@ cp mcp-servers/apple-music/server.js "$HOME/mcp-servers/apple-music/server.js"
 claude mcp add --scope user apple-music \
   -- node "$HOME/mcp-servers/apple-music/server.js"
 
+# Spotify: reliable "play any song" with NO credentials. Playback/controls run via
+# the Spotify app's AppleScript; a song NAME is resolved to a track id by Claude
+# using the Playwright browser tools (Spotify's public search), then played here.
+# Only requirement: the Spotify app + a (free) Spotify account logged in.
+mkdir -p "$HOME/mcp-servers/spotify"
+cp mcp-servers/spotify/server.js "$HOME/mcp-servers/spotify/server.js"
+claude mcp add --scope user spotify \
+  -- node "$HOME/mcp-servers/spotify/server.js"
+
 # Gmail requires one-time OAuth2 setup — see README.md
 if [[ -n "$GMAIL_CLIENT_ID" && -n "$GMAIL_CLIENT_SECRET" ]]; then
   # Install the gaxios fetch patch (fixes "Premature close" on Node v26+).

@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
-"""imsg-send — send an iMessage by NAME, with built-in two-step (2x) confirmation.
+"""imsg-send — send an iMessage by NAME, with two-step (2x) confirm + delivery check.
 
 Usage:
   imsg-send "<name>" "<message>"      step 1: stage + show a preview (sends NOTHING)
-  imsg-send --confirm <token>         step 2: actually send (the one outbound action)
+  imsg-send --confirm <token>         step 2: send, THEN verify it actually delivered
   imsg-send --to <handle> "<message>" stage to an explicit phone/email (skip name lookup)
+  add --force to override the "that's your own Apple ID" safety stop
 
-How the 2x gate works (enforced by the local engine, not just this script):
-  Step 1 -> POST /send/prepare: stages the text, returns a PREVIEW + a one-time token
-            (valid ~120s). Nothing leaves the Mac.
-  Step 2 -> POST /send/confirm: consumes that token and performs the irreversible send.
-The engine audit-logs every action (hash of the text, not the text). 100% local socket.
+Why the delivery check exists: AppleScript's `send` returns success the instant the
+message is handed to Messages — long before (or even when it never) delivers. So after
+confirming, this reads chat.db (is_sent / is_delivered / error) and reports the TRUTH:
+✅ delivered, ⏳ sent-but-not-yet-confirmed, or ❌ NOT delivered (with the iMessage error).
+Two-phase gate is enforced by the engine; nothing leaves the Mac until step 2.
 """
-import sys, os, json, socket, http.client, subprocess
+import sys, os, json, socket, http.client, subprocess, time, re, sqlite3
 
-SOCK = os.path.expanduser("~/.imessage-engine/imsg.sock")
+HOME = os.path.expanduser("~")
+SOCK = f"{HOME}/.imessage-engine/imsg.sock"
+CHATDB = f"{HOME}/Library/Messages/chat.db"
+ALIAS_FILE = f"{HOME}/.imsg-aliases.json"
+APPLE_EPOCH = 978307200  # chat.db dates are ns since 2001-01-01
+
+def self_handles():
+    """Your own iMessage handles (can't message yourself) — local only, never published."""
+    try:
+        d = json.load(open(ALIAS_FILE))
+        return {h.lower() for h in d.get("_self", [])}
+    except Exception:
+        return set()
 
 def engine(method, path, body=None):
     """One request to the engine over its Unix socket -> (status, json|text)."""
@@ -52,36 +65,104 @@ def resolve(name):
         sys.exit(f"✗ no contact found for '{name}'. Add an alias to ~/.imsg-aliases.json, or use --to <handle>.")
     sys.exit(f"✗ '{label}' is ambiguous: {', '.join(cands)}\n  pick one: imsg-send --to <handle> \"<message>\"")
 
+def verify_delivery(handle, since_epoch, timeout=9):
+    """Poll chat.db for the just-sent outgoing message; return (state, error_code).
+    state ∈ delivered | sent_pending | failed | unconfirmed."""
+    last10 = re.sub(r"\D", "", handle)[-10:]
+    deadline = time.time() + timeout
+    best = ("unconfirmed", 0)
+    while time.time() < deadline:
+        try:
+            con = sqlite3.connect(f"file:{CHATDB}?mode=ro", uri=True)
+            row = con.execute(f"""
+                SELECT m.is_sent, m.is_delivered, m.error, m.date_delivered
+                FROM message m JOIN handle h ON m.handle_id=h.ROWID
+                WHERE m.is_from_me=1
+                  AND (LOWER(h.id)=LOWER(?) {"OR h.id LIKE ?" if last10 else ""})
+                  AND (m.date/1e9 + ?) >= ?
+                ORDER BY m.date DESC LIMIT 1""",
+                ([handle] + ([f"%{last10}%"] if last10 else []) + [APPLE_EPOCH, since_epoch - 10])
+            ).fetchone()
+            con.close()
+        except Exception as e:
+            return ("unconfirmed", f"db: {e}")
+        if row:
+            is_sent, is_delivered, error, date_delivered = row
+            if error and int(error) != 0:
+                return ("failed", int(error))
+            if (is_delivered and int(is_delivered)) or (date_delivered and int(date_delivered) > 0):
+                return ("delivered", 0)
+            if is_sent and int(is_sent):
+                best = ("sent_pending", 0)
+        time.sleep(0.4)
+    return best
+
 def main():
     a = sys.argv[1:]
+    force = "--force" in a
+    a = [x for x in a if x != "--force"]
     if not a or a[0] in ("-h", "--help"):
         print(__doc__); return
 
-    if a[0] == "--confirm":                              # step 2: send
+    if a[0] == "--confirm":                              # step 2: send + verify
         if len(a) < 2: sys.exit("usage: imsg-send --confirm <token>")
+        sent_at = time.time()
         st, res = engine("POST", "/send/confirm", {"token": a[1]})
-        if st == 200 and not (isinstance(res, dict) and res.get("error")):
-            detail = res.get("result") or res.get("status") or "ok" if isinstance(res, dict) else res
-            print(f"✅ sent — {detail}")
+        if st != 200 or (isinstance(res, dict) and res.get("error")):
+            sys.exit(f"✗ engine refused the send ({st}): {res}")
+        msg = res if isinstance(res, str) else (res.get("result") or res.get("status") or json.dumps(res))
+        m = re.search(r"to\s+([^\s;]+)", str(msg))
+        handle = m.group(1) if m else None
+        if not handle:
+            print(f"⚠ engine accepted the send ({msg}), but I couldn't parse the recipient to verify delivery — check Messages.")
+            return
+        state, err = verify_delivery(handle, sent_at)
+        if state == "delivered":
+            print(f"✅ DELIVERED to {handle}.")
+        elif state == "sent_pending":
+            print(f"⏳ Sent to {handle}; no error, but delivery not yet acknowledged (they may be offline). Not a failure.")
+        elif state == "failed":
+            extra = "  This is the code you get when texting your OWN Apple ID, or a handle not on iMessage." if err == 22 else ""
+            sys.exit(f"❌ NOT delivered to {handle} — iMessage error {err}.{extra}\n"
+                     f"   The engine ran the send but iMessage rejected it; nothing reached them.")
         else:
-            sys.exit(f"✗ send failed ({st}): {res}")
+            print(f"⚠ Sent to {handle}, but I could NOT confirm delivery within the wait window. Check Messages to be sure.")
         return
 
-    if a[0] == "--to":
-        if len(a) < 3: sys.exit('usage: imsg-send --to <handle> "<message>"')
-        label, handle, text = a[1], a[1], a[2]
-    else:
-        if len(a) < 2: sys.exit('usage: imsg-send "<name>" "<message>"')
-        label, handle = resolve(a[0]); text = a[1]
+    image = None                                          # optional: --image <path>
+    if "--image" in a:
+        i = a.index("--image")
+        if i + 1 >= len(a): sys.exit('usage: imsg-send "<name>" --image <path>')
+        image = a[i + 1]; del a[i:i + 2]
 
-    st, res = engine("POST", "/send/prepare", {"handle": handle, "text": text})   # step 1: stage
+    if a[0] == "--to":
+        if len(a) < 2: sys.exit('usage: imsg-send --to <handle> ("<message>" | --image <path>)')
+        label = handle = a[1]
+        text = a[2] if len(a) > 2 else None
+    else:
+        label, handle = resolve(a[0])
+        text = a[1] if len(a) > 1 else None
+
+    if handle.lower() in self_handles() and not force:    # guard: can't iMessage yourself
+        sys.exit(f"🛑 {handle} is your OWN Apple ID — iMessage can't deliver a message to yourself "
+                 f"(it fails with error 22). Pick a real recipient, or pass --force to try anyway.")
+
+    if image:                                             # step 1: stage an image attachment
+        path = os.path.abspath(os.path.expanduser(image))
+        if not os.path.isfile(path): sys.exit(f"✗ image not found: {path}")
+        st, res = engine("POST", "/sendfile/prepare", {"handle": handle, "file": path})
+        staged = f"image: {path}"
+    else:                                                 # step 1: stage a text message
+        if not text: sys.exit('✗ nothing to send — give a message or --image <path>')
+        st, res = engine("POST", "/send/prepare", {"handle": handle, "text": text})
+        staged = f"text: {text}"
     if st != 200 or (isinstance(res, dict) and res.get("error")):
         sys.exit(f"✗ prepare failed ({st}): {res}")
     token   = res.get("token")   if isinstance(res, dict) else None
     preview = res.get("preview") if isinstance(res, dict) else res
     print("📤 STAGED — nothing has been sent yet:")
     print(f"   to:   {label}  <{handle}>")
-    print(f"   text: {text}")
+    print(f"   {staged}")
     if preview and preview not in (text, None):
         print(f"   engine preview: {preview}")
     if token:

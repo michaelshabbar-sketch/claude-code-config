@@ -4,7 +4,7 @@
 Claude Code with read-only-by-default security, persistent Gmail OAuth2, and a fix
 for a Node.js v26 transport regression.**
 
-Version 1.0 · 2026-06-20
+Version 1.1 · 2026-06-20
 
 ---
 
@@ -200,6 +200,40 @@ tool is blocked; every read and browser tool remains callable.
   **noreply** address, so no personal email or placeholder token text appears in
   any commit.
 
+### 4.6 Local action tools: two-phase sends with *verified* delivery
+
+Alongside the MCP data servers, this setup ships local CLIs (`tools/imsg`,
+`tools/imsg-send`) backed by a small Swift "iMessage engine" that exposes a
+read-only-by-default API over a `0600` Unix socket. Its write paths (send text,
+send a picture, place a call) extend the same least-privilege philosophy as §4.1
+and surfaced two lessons worth recording:
+
+**The write gate *is* the two-step approval.** Every send is `prepare → confirm`:
+`prepare` validates and stages the action and returns a single-use, 120-second
+token but transmits nothing; `confirm` consumes that token and performs the single
+irreversible step. A lost, reused, or expired token fails closed — nothing sends.
+This is the user-facing "approve anything outbound twice" rule enforced in code,
+with a hash-chained audit log that stores a *hash* of the message, never its text.
+
+**"Accepted" is not "delivered" — verify the result.** Sends run
+`osascript … send … to buddy`, but AppleScript's `send` returns the instant Messages
+*accepts* the text — long before, or even when it never, delivers. Trusting that exit
+code reported failures as successes: a message to one's own Apple ID (undeliverable,
+`chat.db error = 22`) and a throttled send (`error = 25`) each printed a green
+"✅ sent" while Messages showed red **Not Delivered**. The fix snapshots the database's
+maximum row id before sending, then polls the resulting message row's
+`error` / `is_delivered` / `is_sent` columns and reports the true outcome
+(*delivered* / *sent, unconfirmed* / *not delivered ⟨code⟩*). Attachments added two
+more traps. First, constructing the file reference (`POSIX file …`) **inside** the
+`tell application "Messages"` block silently sent an *empty* message — the reference
+must be built at top level. Second, staging the file in `/tmp` made the **upload**
+fail (`chat.db transfer_state = 6`, `error = 25`) because the Messages sandbox cannot
+read `/private/tmp`; copying the image into a standard, sandbox-readable folder
+(`~/Pictures`) before sending — and deleting it after — yields `transfer_state = 5`
+and a delivered image. Every one of these bugs was caught only because delivery is
+now checked against the database instead of inferred from a process exit code: a
+worked example of *verify the effect, not the call*.
+
 ---
 
 ## 5. Quality assurance
@@ -259,6 +293,10 @@ See `README.md` for the file-by-file inventory and `setup.sh` for the exact step
 | `secrets.sh.example` | Template for the gitignored `secrets.sh` |
 | `settings.local.json.example` | Local Bash-permission allowlist template |
 | `.gitignore` | Excludes all credentials, tokens, and local secrets |
+| `statusline.sh` | Local status bar — model, context, Claude + Codex cost |
+| `tools/imsg` | Read iMessages by name (read-only) |
+| `tools/imsg-send` | Send text/picture by name — two-phase confirm + delivery check |
+| `tools/usage` | Claude (metered) + Codex (free plan) spend summary |
 | `README.md` | Quick start + reference |
 | `WHITEPAPER.md` | This document |
 
